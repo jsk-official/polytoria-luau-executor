@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <iostream>
+#include <string>
 
 #include "MinHook.h"
 
@@ -18,7 +19,7 @@ FARPROC luau_compile_addr = GetProcAddress(luaCompilerDLL, "luau_compile");
 typedef int(__cdecl* luau_load_type)(LPVOID lua_State, const char* chunkname, const char* data, size_t size, int env);
 luau_load_type luau_load = (luau_load_type)luau_load_addr;
 
-typedef char*(__cdecl* luau_compile_type)(const char* source, size_t size, LPVOID options, size_t* outsize);
+typedef char* (__cdecl* luau_compile_type)(const char* source, size_t size, LPVOID options, size_t* outsize);
 luau_compile_type luau_compile = (luau_compile_type)luau_compile_addr;
 
 typedef int(__cdecl* luau_pcall_type)(LPVOID lua_State, int nargs, int nresults, int errfunc);
@@ -27,7 +28,22 @@ luau_pcall_type lua_pcall = (luau_pcall_type)luau_pcall_addr;
 typedef int(__cdecl* luau_resume_type)(LPVOID lua_State, LPVOID from, int nargs);
 luau_resume_type lua_resume = (luau_resume_type)luau_resume_addr;
 
-int execute(LPVOID lua_State, const char* source) {
+const char* source;
+
+bool executed = false;
+
+void execute(const char* src) {
+    source = src;
+
+    MH_EnableHook((LPVOID)luau_resume_addr);
+}
+
+int hooked_lua_resume(LPVOID lua_State, LPVOID lua_state_from, int nargs) {
+    std::cout << "Hook Hit" << std::endl;
+    std::cout << "Lua state address: " << lua_State << std::endl;
+
+    MH_DisableHook(NULL); // disables all hooks, but whatever
+
     size_t bytecode_size = 0;
     char* bytecode = luau_compile(source, strlen(source), NULL, &bytecode_size);
 
@@ -39,21 +55,9 @@ int execute(LPVOID lua_State, const char* source) {
 
     std::cout << "lua_pcall result: " << pcall_result << std::endl;
 
-    return pcall_result;
-}
-
-int hooked_lua_resume(LPVOID lua_State, LPVOID lua_state_from, int nargs) {
-    std::cout << "Hook Hit" << std::endl;
-    std::cout << "Lua state address: " << lua_State << std::endl;
-    
-    MH_DisableHook(NULL); // disables all hooks, but whatever
-
-    execute(lua_State, "game.Players.LocalPlayer.SprintSpeed = 200"); // did not implement anything for receiving code from the user
+    executed = true;
 
     return lua_resume(lua_State, lua_state_from, nargs);
-
-    // also, i'm pretty sure this lua_State becomes invalidated/unused at some point, trying to use it later (like 1 second later) often causes a crash
-    // just re-enable the hook and grab another lua_State address then use that when executing again later, lua_resume seems to be called like all the time
 }
 
 int main() {
@@ -64,10 +68,43 @@ int main() {
     std::cout << "lua_resume address: " << luau_resume_addr << std::endl;
 
     MH_STATUS status = MH_CreateHook((LPVOID)luau_resume_addr, hooked_lua_resume, &old_lua_resume);
+
     if (status == MH_OK) {
         std::cout << "Hook success" << std::endl;
 
-        MH_EnableHook((LPVOID)luau_resume_addr);
+        while (true) {
+            int wait_count = 0;
+
+            std::cout << "Enter a Luau script to execute: ";
+            std::string script;
+
+            std::getline(std::cin, script);
+
+            std::cout << "\nExecuting..." << std::endl;
+
+            executed = false;
+
+            execute(script.c_str());
+
+            while (!executed) {
+                if (wait_count == 10) {
+					std::cout << "Timed out waiting for script execution (1s). This likely means that the game is not currently executing any client-sided Luau scripts, or that the hook was not properly set up, hence we cannot find a lua_State address to use." << std::endl;
+				
+					break;
+                }
+
+                Sleep(100);
+
+                wait_count += 1;
+            }
+
+            if (executed) {
+                std::cout << "Execution complete!" << std::endl;
+            }
+        }
+    }
+    else {
+		std::cout << "Failed to create hook. Error code: " << status << std::endl;
     }
 }
 
@@ -80,6 +117,25 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, // handle to DLL module
     case DLL_PROCESS_ATTACH:
         MH_Initialize();
         DisableThreadLibraryCalls(hinstDLL);
+
+		if (luaCompilerDLL == 0) {
+            std::cout << "Failed to get module handle for Luau.Compiler.dll. Trying to load..." << std::endl;
+
+			luaCompilerDLL = LoadLibraryA("Luau.Compiler.dll");
+
+            luau_compile_addr = GetProcAddress(luaCompilerDLL, "luau_compile");
+            luau_compile = (luau_compile_type)luau_compile_addr;
+
+            if (luaCompilerDLL == 0) {
+                std::cout << "Failed to load Luau.Compiler.dll. Error code: " << GetLastError() << std::endl;
+
+				break;
+            }
+        }
+
+        if (luaVMDLL == 0) {
+            std::cout << "Failed to get module handle for Luau.VM.dll. This game likely does not contain any client-sided Luau scripts." << std::endl;
+        }
 
         CreateThread(nullptr, 0x1000, reinterpret_cast<LPTHREAD_START_ROUTINE>(main), 0, 0, nullptr);
         break;
